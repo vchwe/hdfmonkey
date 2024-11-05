@@ -14,8 +14,8 @@
 
 static ssize_t image_file_read(volume_container *v, off_t position, void *buf, size_t count) {
 	int fd = v->data.file.fd;
-	int done = 0;
-	int res;
+	ssize_t done = 0;
+	ssize_t res;
 	
 	if ((res = lseek(fd, position + v->data.file.data_offset, SEEK_SET)) < 0) {
 		return res;
@@ -37,8 +37,8 @@ static ssize_t image_file_read(volume_container *v, off_t position, void *buf, s
 
 static ssize_t image_file_write(volume_container *v, off_t position, void *buf, size_t count) {
 	int fd = v->data.file.fd;
-	int done = 0;
-	int res;
+	ssize_t done = 0;
+	ssize_t res;
 	
 	if ((res = lseek(fd, position + v->data.file.data_offset, SEEK_SET)) < 0) {
 		return res;
@@ -175,7 +175,7 @@ int hdf_write_header(int fd, unsigned long sector_count) {
 	char *header, *identity;
 	unsigned long head_count, cyl_count, sectors_per_head, sectors_per_track;
 	int res;
-	int written;
+	size_t written;
 	
 	header = calloc( 1, HDF_HEADER_SIZE );
 	

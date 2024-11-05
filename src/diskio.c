@@ -48,12 +48,12 @@ DRESULT disk_read (
 {
 	volume_container *vol;
 	size_t size_requested;
-	size_t result;
-	
+	ssize_t result;
+
 	vol = volume_containers[drv];
-	size_requested = count * vol->bytes_per_sector;
-	
-	result = vol->read(vol, sector * vol->bytes_per_sector, (void *)buff,
+	size_requested = (size_t)count * vol->bytes_per_sector;
+
+	result = vol->read(vol, (size_t)sector * vol->bytes_per_sector, (void *)buff,
 		size_requested);
 	
 	if (result == size_requested) {
@@ -78,12 +78,12 @@ DRESULT disk_write (
 {
 	volume_container *vol;
 	size_t size_requested;
-	size_t result;
-	
+	ssize_t result;
+
 	vol = volume_containers[drv];
-	size_requested = count * vol->bytes_per_sector;
-	
-	result = vol->write(vol, sector * vol->bytes_per_sector, (void *)buff,
+	size_requested = (size_t)count * vol->bytes_per_sector;
+
+	result = vol->write(vol, (size_t)sector * vol->bytes_per_sector, (void *)buff,
 		size_requested);
 	
 	if (result == size_requested) {
