@@ -16,10 +16,30 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+/* The following changes required for FatFs (see FatFs.r15.patch):
+   - ffconfig.h
+	- FF_USE_MKFS 1
+	- FF_CODE_PAGE 850 (Latin 1)
+	- FF_USE_LFN 1
+	- FF_VOLUMES 2
+   - ff.h
+	- add 'TCHAR label[11];        // Volume label (11 chars max) ' to MKFS_PARM
+   - ff.c
+	- initialise MKFS_PARM.label in f_mkfs ', "           " };'
+	- after memcpy(buf + BS_VolLab32, ... add 'if (opt->label[0]) memcpy(buf+BS_VolLab32, opt->label, 11);'
+	- after memcpy(buf + BS_VolLab, ... add the following:
+		- if (fsty == FS_FAT12) memcpy(buf+BS_FilSysType+3, "12", 2);
+		- else memcpy(buf+BS_FilSysType+3, "16", 2);
+		- if (opt->label[0]) memcpy(buf+BS_VolLab, opt->label, 11);
+ */
+
+#include <config.h>
+
 #define DIR FATDIR
 #include "ff.h"
 #undef DIR
 
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -32,6 +52,9 @@
 #include "diskio.h"
 
 #include "ffconf.h"
+
+static const char DRV_0[] = "0:";
+static const char DRV_1[] = "1:";
 
 #define BUFFER_SIZE 2048
 #define CLONE_BUFFER_SIZE 1048576
@@ -88,10 +111,72 @@ static void fat_perror(char *custom_message, FRESULT result) {
 		case FR_TIMEOUT:
 			error_message = "Timeout";
 			break;
+		case FR_LOCKED:
+			error_message = "File locked";
+			break;
+		case FR_NOT_ENOUGH_CORE:
+			error_message = "Not enough memory";
+			break;
+		case FR_TOO_MANY_OPEN_FILES:
+			error_message = "Too many open files";
+			break;
+		case FR_INVALID_PARAMETER:
+			error_message = "Invalid parameter";
+			break;
 		default:
 			error_message = "Unknown error code";
 	}
 	printf("%s: %s\n", custom_message, error_message);
+}
+
+/* compatibility wrapper for newer FatFs */
+static FRESULT f_mkfs_compat(
+        BYTE drv,                       /* Logical drive number */
+        BYTE partition,         /* Partitioning rule 0:FDISK, 1:SFD */
+        WORD allocsize,         /* Allocation unit size [bytes] */
+        char *volume_label,
+        BYTE fmt
+)
+{
+	FRESULT result;
+	BYTE work[FF_MAX_SS];	/* Working buffer */
+	const char *path = 0 == drv ? DRV_0 : DRV_1; /* Logical drive number */
+	// "format should generate two FATs (required by ESXDOS)" see 8ee674b
+	MKFS_PARM opt = { .n_fat = 2, .au_size = allocsize }; /* Format options */
+	// NOTE: ff.c has to be patched to change "FAT Signature" in VBR
+	// "Use 'FAT12'/'FAT16' as the type descriptor,
+	//     not just 'FAT' - ESXDOS checks it to distinguish from FAT32"
+	// see a9af42a
+
+	// "allow specifying a volume name on format/create" see 1b470de
+	memset(opt.label, ' ', 11);
+	if (volume_label) {
+		for (int i=0; i<11 && *volume_label; i++) {
+			opt.label[i] = *volume_label++;
+		}
+	}
+	// Newer f_mkfs has different params and no longer allows direct
+	// FAT type choice. The only option remaining is the ability to
+	// force FAT32 (provided volume is big enough)
+	// thus, we must re-map FS_FATxx to FM_FATxx
+	switch (fmt) {
+		case FS_FAT32:
+			opt.fmt = FM_FAT32;
+			break;
+		case FS_FAT12:
+		case FS_FAT16:
+			opt.fmt = FM_FAT;
+			break;
+		default:
+			opt.fmt = FM_FAT|FM_FAT32;
+			break;
+	}
+	// not used, but for the sake of completeness...
+	if (1==partition) {
+		opt.fmt |= FM_SFD;
+	}
+
+	return f_mkfs(path, &opt, work, sizeof(work));
 }
 
 /* Open the file at pathname as an HDF or raw disk image, populating the passed
@@ -111,7 +196,7 @@ static int open_image(char *pathname, volume_container *vol, FATFS *fatfs, int w
 	disk_map(0, vol);
 	
 	if (fatfs != NULL) {
-		if (f_mount(0, fatfs) != FR_OK) {
+		if (f_mount(fatfs, DRV_0, 0) != FR_OK) {
 			printf("mount failed\n");
 			return -1;
 		}
@@ -131,7 +216,7 @@ static int filename_is_hdf(char *filename) {
 	);
 }
 
-static int fat_path_is_dir(XCHAR *filename) {
+static int fat_path_is_dir(TCHAR *filename) {
 	/* Test whether the given filename is a directory in the FAT filesystem. */
 	/* Do this the quick-and-dirty way, by f_opendir-ing and checking for errors */
 	FATDIR dir;
@@ -448,11 +533,7 @@ static int cmd_ls(int argc, char *argv[]) {
 	FRESULT result;
 	FILINFO file_info;
 	
-	XCHAR* dirname;
-	
-#if _USE_LFN
-	XCHAR lfname[255];
-#endif
+	TCHAR* dirname;
 	
 	if (argc < 3) {
 		printf("No image filename supplied\n");
@@ -478,10 +559,6 @@ static int cmd_ls(int argc, char *argv[]) {
 		return -1;
 	}
 	
-#if _USE_LFN
-	file_info.lfname = lfname;
-	file_info.lfsize = 255;
-#endif
 	while(1) {
 		if ((result = f_readdir(&dir, &file_info)) != FR_OK) {
 			fat_perror("Error reading dir", result);
@@ -493,18 +570,17 @@ static int cmd_ls(int argc, char *argv[]) {
 		if (file_info.fattrib & AM_DIR) {
 			printf("[DIR]\t");
 		} else {
-			printf("%ld\t", file_info.fsize);
+			printf("%d\t", file_info.fsize);
 		}
 		
-#if _USE_LFN
-		if (file_info.lfname[0]) {
-			printf("%s\n", file_info.lfname);
-		} else {
-			printf("%s\n", file_info.fname);
-		}
-#else
+		/* TL;DR: just use fname unless you really need 8.3 name */
 		printf("%s\n", file_info.fname);
-#endif
+/* http://elm-chan.org/fsw/ff/doc/readdir.html
+"When LFN is enabled, a member altname[] is defined in the file
+information structure to store the short file name of the object. If the
+long file name is not accessible due to any reason listed below, short
+file name is stored to the fname[] and the altname[] has a null string."
+*/
 	}
 	
 	vol_container.close(&vol_container);
@@ -549,12 +625,12 @@ static int cmd_format(int argc, char *argv[]) {
 		printf("Usage: hdfmonkey format [--fat12|--fat16|--fat32] <imagefile> [volumelabel]\n");
 		return -1;
 	}
-	
+
 	if (open_image(image_filename, &vol, &fatfs, 1) == -1) {
 		return -1;
 	}
 	
-	result = f_mkfs(0, 0, 0, volumelabel, fmt);
+	result = f_mkfs_compat(0, 0, 0, volumelabel, fmt);
 	if (result != FR_OK) {
 		fat_perror("Formatting failed", result);
 		return -1;
@@ -633,13 +709,13 @@ static int cmd_create(int argc, char *argv[]) {
 	
 	disk_map(0, &vol);
 	
-	if (f_mount(0, &fatfs) != FR_OK) {
+	if (f_mount(&fatfs, DRV_0, 0) != FR_OK) {
 		printf("mount failed\n");
 		vol.close(&vol);
 		return -1;
 	}
 	
-	result = f_mkfs(0, 0, 0, volumelabel, fmt);
+	result = f_mkfs_compat(0, 0, 0, volumelabel, fmt);
 	if (result != FR_OK) {
 		fat_perror("Formatting failed", result);
 		vol.close(&vol);
@@ -716,17 +792,14 @@ static int cmd_rm(int argc, char *argv[]) {
 
 /* Recursively copy directory contents file-by-file from one filesystem to another.
 The destination directory must exist. */
-static int copy_dir(XCHAR *source_dirname, XCHAR *destination_dirname) {
+static int copy_dir(TCHAR *source_dirname, TCHAR *destination_dirname) {
 	FIL source_file, destination_file;
 	FRESULT result;
 	char buffer[BUFFER_SIZE];
 	UINT bytes_read, bytes_written;
 	FATDIR source_dir;
 	FILINFO file_info;
-	XCHAR *source_filename, *destination_filename;
-#if _USE_LFN
-	XCHAR lfname[255];
-#endif
+	TCHAR *source_filename, *destination_filename;
 
 	result = f_opendir(&source_dir, source_dirname);
 	if (result != FR_OK) {
@@ -734,10 +807,6 @@ static int copy_dir(XCHAR *source_dirname, XCHAR *destination_dirname) {
 		return -1;
 	}
 
-#if _USE_LFN
-	file_info.lfname = lfname;
-	file_info.lfsize = 255;
-#endif
 	while(1) {
 		if ((result = f_readdir(&source_dir, &file_info)) != FR_OK) {
 			fat_perror("Error reading dir", result);
@@ -745,18 +814,15 @@ static int copy_dir(XCHAR *source_dirname, XCHAR *destination_dirname) {
 		}
 		if (file_info.fname[0] == '\0') break;
 		
-#if _USE_LFN
-		if (file_info.lfname[0]) {
-			source_filename = concat_filename(source_dirname, file_info.lfname);
-			destination_filename = concat_filename(destination_dirname, file_info.lfname);
-		} else {
-			source_filename = concat_filename(source_dirname, file_info.fname);
-			destination_filename = concat_filename(destination_dirname, file_info.fname);
-		}
-#else
-		source_filename = concat_filename(source_dirname, file_info.lfname);
-		destination_filename = concat_filename(destination_dirname, file_info.lfname);
-#endif
+		/* TL;DR: just use fname unless you really need 8.3 name */
+		source_filename = concat_filename(source_dirname, file_info.fname);
+		destination_filename = concat_filename(destination_dirname, file_info.fname);
+/* http://elm-chan.org/fsw/ff/doc/readdir.html
+"When LFN is enabled, a member altname[] is defined in the file
+information structure to store the short file name of the object. If the
+long file name is not accessible due to any reason listed below, short
+file name is stored to the fname[] and the altname[] has a null string."
+*/
 
 		if (file_info.fattrib & AM_DIR) {
 			/* File is a directory - copy recursively */
@@ -886,14 +952,14 @@ static int cmd_rebuild(int argc, char *argv[]) {
 	
 	disk_map(1, &destination_vol);
 	
-	if (f_mount(1, &destination_fatfs) != FR_OK) {
+	if (f_mount(&destination_fatfs, DRV_1, 0) != FR_OK) {
 		printf("mount failed\n");
 		source_vol.close(&source_vol);
 		destination_vol.close(&destination_vol);
 		return -1;
 	}
 	
-	result = f_mkfs(1, 0, 0, volumelabel, fmt);
+	result = f_mkfs_compat(1, 0, 0, volumelabel, fmt);
 	if (result != FR_OK) {
 		fat_perror("Formatting failed", result);
 		source_vol.close(&source_vol);
@@ -910,7 +976,8 @@ static int cmd_rebuild(int argc, char *argv[]) {
 
 static int cmd_help(int argc, char *argv[]) {
 	if (argc < 3) {
-		printf("hdfmonkey: utility for manipulating HDF disk images\n\n");
+		printf("hdfmonkey: utility for manipulating HDF disk images v" VERSION "\n");
+		printf("           using FatFs revision %d\n\n", FF_DEFINED);
 		printf("usage: hdfmonkey <command> [args]\n\n");
 		printf("Type 'hdfmonkey help <command>' for help on a specific command.\n");
 		printf("Available commands:\n");
@@ -982,6 +1049,6 @@ int main(int argc, char *argv[]) {
 	} else {
 		printf("Unknown command: '%s'\n", argv[1]);
 	}
-	printf("Type 'hdfmonkey help' for usage.\n");
+	printf("Type 'hdfmonkey help' for usage. v" VERSION "\n");
 	return 0;
 }
